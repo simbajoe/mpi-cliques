@@ -1,7 +1,10 @@
+#include <omp.h>
+#include <pcontrol.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
 #include <math.h>
+#include <mpi.h>
 
 struct graph {
     int *edges;
@@ -312,6 +315,7 @@ int cpc(int ***a1, int *n1, int **ns1, int **a2, int n2, int *ns2) {
 
 void free_cl(int **r, int *ns, int n) {
     int i;
+    if (!n) return;
     for (i = 0; i < n; i++) {
         free(r[i]);
     }
@@ -343,48 +347,114 @@ void clique_i(int i, struct graph *g, int ***res, int **rns, int *nn) {
     clique(&i, 1, g->edges + g->off[i], g->ec[i], g, res, rns, nn);
 }
 
-int main() {
-    srand( time(NULL) );
-    int size = 200;
-    int m = 12;
-    double p = 0.15;
+int main (argc, argv)
+    int argc;
+    char *argv[];
+{
+    MPI_Status status;
+    int rank, m;
+
+    MPI_Init (&argc, &argv);  /* starts MPI */
+    MPI_Pcontrol(TRACEFILES, NULL, "trace", 0);
+    MPI_Pcontrol(TRACELEVEL, 1, 1, 1);
+    MPI_Pcontrol(TRACENODE, 1000000, 1, 1);
+
+    MPI_Comm_rank (MPI_COMM_WORLD, &rank);    /* get current process id */
+    MPI_Comm_size (MPI_COMM_WORLD, &m);    /* get number of processes */
+
     struct graph g;
     int i, j, t;
     int **res;
     int *rns;
     int rn = 0;
 
-    //for (j = 0; j < m; j++) {
-        //printf("% 4d: ", j);
-        //for (i = 0; i < size / m + 1; i++) {
-            //if (i % 2) t = (i + 1) * m - j - 1;
-            //else t = i * m + j;
-            //if (t < size)
-            //printf("% 4d ", t);
-        //}
-        //printf("\n");
-    //}
-    //return 1;
+    if (rank == 0) {
+	int size = 8000;
+	double p = 0.01;
+	srand( time(NULL) );
+	g = generate(size, p);
 
-    g = generate(size, p);
+/*
+	printf("M\n");
+	print_m(&g);
+	printf("Neighbors\n");
+	print_n(&g);
+*/
+	printf("%d vertices\n", g.size);
+	printf("%d edges\n", g.me);
+    }
 
-    //printf("M\n");
-    //print_m(&g);
-    //printf("Neighbors\n");
-    //print_n(&g);
+    MPI_Bcast(&g.size, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&g.me, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    if (rank != 0) {
+	g.ec = (int *) malloc(g.size * sizeof(int));
+	g.off = (int *) malloc(g.size * sizeof(int));
+	g.nc = (int *) malloc(g.size * sizeof(int));
+	g.neigs = (int **) malloc(g.size * sizeof(int *));
+	g.edges = (int *) malloc(g.me * sizeof(int));
+    }
+    MPI_Bcast(g.ec, g.size, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(g.off, g.size, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(g.nc, g.size, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(g.edges, g.me, MPI_INT, 0, MPI_COMM_WORLD);
 
     for (i = 0; i < g.size; i++) {
-        clique_i(i, &g, &res, &rns, &rn);
+	if (rank != 0) {
+	    g.neigs[i] = (int *) malloc(g.nc[i] * sizeof(int));
+	}
+	MPI_Bcast(g.neigs[i], g.nc[i], MPI_INT, 0, MPI_COMM_WORLD);
     }
-    printf("%d vertices\n", g.size);
-    printf("%d edges\n", g.me);
-    printf("%d cliques\n", rn);
-    for (i = 0; i < rn; i++) {
-        print_edge(res[i], rns[i]);
+	double start_time = MPI_Wtime();
+	MPI_Pcontrol(TRACEEVENT, "entry", 1, 0, NULL);
+    for (i = 0; i < g.size / m + 1; i++) {
+	if (i % 2) t = (i + 1) * m - rank - 1;
+	else t = i * m + rank;
+	if (t < g.size) {
+            clique_i(t, &g, &res, &rns, &rn);
+	}
+	//printf("rank %d. ready: %d\n", rank, i + 1);
     }
-    printf("\n");
-    free_cl(res, rns, rn);
+	MPI_Pcontrol(TRACEEVENT, "exit", 1, 0, NULL);
+    if (rank != 0) {
+	MPI_Ssend(&rn, 1, MPI_INT, 0, 1, MPI_COMM_WORLD);
+/*	if (rn) {
+	    MPI_Ssend(rns, rn, MPI_INT, 0, 2, MPI_COMM_WORLD);
+	    for (i = 0; i < rn; i++) {
+		MPI_Ssend(res[i], rns[i], MPI_INT, 0, 3, MPI_COMM_WORLD);
+	    }
+	}*/
+    } else {
+	int an = rn;
+	printf("run time: %lf\n", MPI_Wtime() - start_time);
+	int trn;
+	int *trns;
+	int **tres;
+	for (i = 1; i < m; i++) {
+	    MPI_Recv(&trn, 1, MPI_INT, i, 1, MPI_COMM_WORLD, &status);
+	    an += trn;
+	    /*if (trn) {
+		trns = (int *) malloc(trn * sizeof(int));
+		MPI_Recv(trns, trn, MPI_INT, i, 2, MPI_COMM_WORLD, &status);
+		tres = (int **) malloc(trn * sizeof(int *));
+		for (j = 0; j < trn; j++) {
+		   tres[j] = (int *) malloc(trns[j] * sizeof(int));
+		   MPI_Recv(tres[j], trns[j], MPI_INT, i, 3, MPI_COMM_WORLD, &status);
+		}
+		cpc(&res, &rn, &rns, tres, trn, trns);
+	        free_cl(tres, trns, trn);
+	    }*/
+	}
+	printf("total cliques: %d\n", an);
+/*
+	for (i = 0; i < rn; i++) {
+	    print_edge(res[i], rns[i]);
+	}
+*/
+    }
 
+    free_cl(res, rns, rn);
     free_graph(&g);
-    return 1;
+
+    MPI_Finalize();
+    return 0;
 }
